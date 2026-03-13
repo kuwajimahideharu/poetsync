@@ -26,7 +26,8 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var DEFAULT_SETTINGS = {
   serverUrl: "ws://localhost:27124",
-  enabled: true
+  enabled: true,
+  sendEnabled: true
 };
 var PoetSyncPlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -40,6 +41,36 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
     await this.loadSettings();
     this.addSettingTab(new PoetSyncSettingTab(this.app, this));
     if (this.settings.enabled) this.connect();
+    this.registerEvent(
+      this.app.vault.on("modify", async (file) => {
+        if (!this.settings.sendEnabled) return;
+        if (this.ignorePaths.has(file.path)) return;
+        if (!(file instanceof import_obsidian.TFile)) return;
+        if (this.ws?.readyState !== WebSocket.OPEN) return;
+        const content = await this.app.vault.read(file);
+        this.ws.send(JSON.stringify({
+          type: "save_file",
+          path: file.path,
+          content,
+          timestamp: Date.now()
+        }));
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("create", async (file) => {
+        if (!this.settings.sendEnabled) return;
+        if (this.ignorePaths.has(file.path)) return;
+        if (!(file instanceof import_obsidian.TFile)) return;
+        if (this.ws?.readyState !== WebSocket.OPEN) return;
+        const content = await this.app.vault.read(file);
+        this.ws.send(JSON.stringify({
+          type: "save_file",
+          path: file.path,
+          content,
+          timestamp: Date.now()
+        }));
+      })
+    );
     console.log("PoetSync plugin loaded");
   }
   connect() {
@@ -98,7 +129,7 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         }
         await vault.create(filePath, content);
       }
-      setTimeout(() => this.ignorePaths.delete(filePath), 3e3);
+      setTimeout(() => this.ignorePaths.delete(filePath), 5e3);
       console.log(`PoetSync: Synced ${filePath}`);
     }
     if (message.type === "file_deleted") {
@@ -106,7 +137,7 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
       if (file) {
         this.ignorePaths.add(message.path);
         await vault.delete(file);
-        setTimeout(() => this.ignorePaths.delete(message.path), 3e3);
+        setTimeout(() => this.ignorePaths.delete(message.path), 5e3);
         console.log(`PoetSync: Deleted ${message.path}`);
       }
     }
@@ -136,8 +167,12 @@ var PoetSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.serverUrl = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u540C\u671F\u3092\u6709\u52B9\u5316").addToggle((toggle) => toggle.setValue(this.plugin.settings.enabled).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("\u540C\u671F\u3092\u6709\u52B9\u5316").setDesc("\u30B5\u30FC\u30D0\u30FC\u3078\u306E\u63A5\u7D9A\u3092\u6709\u52B9\u306B\u3059\u308B").addToggle((toggle) => toggle.setValue(this.plugin.settings.enabled).onChange(async (value) => {
       this.plugin.settings.enabled = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("\u9001\u4FE1\u3092\u6709\u52B9\u5316").setDesc("\u3053\u306E\u30C7\u30D0\u30A4\u30B9\u306E\u5909\u66F4\u3092\u30B5\u30FC\u30D0\u30FC\u306B\u9001\u4FE1\u3059\u308B\uFF08iPhone\u306F\u30AA\u30F3\u3001Ubuntu\u306F\u30AA\u30D5\uFF09").addToggle((toggle) => toggle.setValue(this.plugin.settings.sendEnabled).onChange(async (value) => {
+      this.plugin.settings.sendEnabled = value;
       await this.plugin.saveSettings();
     }));
   }
