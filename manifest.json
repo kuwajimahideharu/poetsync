@@ -1,0 +1,9 @@
+{
+  "id": "poetsync",
+  "name": "PoetSync",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Simple and stable Obsidian sync via WebSocket",
+  "author": "Hideharu",
+  "isDesktopOnly": false
+}
