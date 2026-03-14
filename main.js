@@ -48,12 +48,7 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         if (!(file instanceof import_obsidian.TFile)) return;
         if (this.ws?.readyState !== WebSocket.OPEN) return;
         const content = await this.app.vault.read(file);
-        this.ws.send(JSON.stringify({
-          type: "save_file",
-          path: file.path,
-          content,
-          timestamp: Date.now()
-        }));
+        this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, timestamp: Date.now() }));
       })
     );
     this.registerEvent(
@@ -63,12 +58,24 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         if (!(file instanceof import_obsidian.TFile)) return;
         if (this.ws?.readyState !== WebSocket.OPEN) return;
         const content = await this.app.vault.read(file);
-        this.ws.send(JSON.stringify({
-          type: "save_file",
-          path: file.path,
-          content,
-          timestamp: Date.now()
-        }));
+        this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, timestamp: Date.now() }));
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (!this.settings.sendEnabled) return;
+        if (this.ignorePaths.has(file.path)) return;
+        if (this.ws?.readyState !== WebSocket.OPEN) return;
+        console.log(`PoetSync: Sending delete for ${file.path}`);
+        this.ws.send(JSON.stringify({ type: "delete_file", path: file.path, timestamp: Date.now() }));
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", async (file, oldPath) => {
+        if (!this.settings.sendEnabled) return;
+        if (this.ws?.readyState !== WebSocket.OPEN) return;
+        console.log(`PoetSync: Sending rename ${oldPath} -> ${file.path}`);
+        this.ws.send(JSON.stringify({ type: "rename_file", oldPath, newPath: file.path, timestamp: Date.now() }));
       })
     );
     console.log("PoetSync plugin loaded");
@@ -109,10 +116,7 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
     const vault = this.app.vault;
     if (message.type === "file_added" || message.type === "file_changed") {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({
-          type: "get_file",
-          path: message.path
-        }));
+        this.ws.send(JSON.stringify({ type: "get_file", path: message.path }));
       }
     }
     if (message.type === "file_content") {
@@ -139,6 +143,23 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         await vault.delete(file);
         setTimeout(() => this.ignorePaths.delete(message.path), 5e3);
         console.log(`PoetSync: Deleted ${message.path}`);
+      }
+    }
+    if (message.type === "file_renamed") {
+      const file = vault.getAbstractFileByPath(message.oldPath);
+      if (file) {
+        this.ignorePaths.add(message.oldPath);
+        this.ignorePaths.add(message.newPath);
+        const dir = message.newPath.split("/").slice(0, -1).join("/");
+        if (dir && !vault.getAbstractFileByPath(dir)) {
+          await vault.createFolder(dir);
+        }
+        await vault.rename(file, message.newPath);
+        setTimeout(() => {
+          this.ignorePaths.delete(message.oldPath);
+          this.ignorePaths.delete(message.newPath);
+        }, 5e3);
+        console.log(`PoetSync: Renamed ${message.oldPath} -> ${message.newPath}`);
       }
     }
   }
@@ -171,7 +192,7 @@ var PoetSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.enabled = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("\u9001\u4FE1\u3092\u6709\u52B9\u5316").setDesc("\u3053\u306E\u30C7\u30D0\u30A4\u30B9\u306E\u5909\u66F4\u3092\u30B5\u30FC\u30D0\u30FC\u306B\u9001\u4FE1\u3059\u308B\uFF08iPhone\u306F\u30AA\u30F3\u3001Ubuntu\u306F\u30AA\u30D5\uFF09").addToggle((toggle) => toggle.setValue(this.plugin.settings.sendEnabled).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("\u9001\u4FE1\u3092\u6709\u52B9\u5316").setDesc("\u3053\u306E\u30C7\u30D0\u30A4\u30B9\u306E\u5909\u66F4\u3092\u30B5\u30FC\u30D0\u30FC\u306B\u9001\u4FE1\u3059\u308B\uFF08Ubuntu\u306F\u30AA\u30D5\u3067OK\uFF09").addToggle((toggle) => toggle.setValue(this.plugin.settings.sendEnabled).onChange(async (value) => {
       this.plugin.settings.sendEnabled = value;
       await this.plugin.saveSettings();
     }));
