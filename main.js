@@ -114,6 +114,16 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
   }
   async handleMessage(message) {
     const vault = this.app.vault;
+    if (message.type === "file_list") {
+      const serverFiles = message.files;
+      for (const filePath of Object.keys(serverFiles)) {
+        const localFile = vault.getAbstractFileByPath(filePath);
+        if (!localFile && this.ws?.readyState === WebSocket.OPEN) {
+          console.log(`PoetSync: Missing file detected, fetching: ${filePath}`);
+          this.ws.send(JSON.stringify({ type: "get_file", path: filePath }));
+        }
+      }
+    }
     if (message.type === "file_added" || message.type === "file_changed") {
       if (this.ws?.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: "get_file", path: message.path }));
