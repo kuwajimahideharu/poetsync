@@ -1,0 +1,16 @@
+[Unit]
+Description=PoetSync WebSocket Server
+After=network.target
+
+[Service]
+Type=simple
+User=hideharu
+WorkingDirectory=/home/hideharu/poetsync-server
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
