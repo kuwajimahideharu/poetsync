@@ -36,6 +36,12 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
     this.reconnectTimer = null;
     this.isConnecting = false;
     this.ignorePaths = /* @__PURE__ */ new Set();
+    // サーバー側の既知ハッシュを永続保持（再接続時の無駄な再ダウンロードを防ぐ）
+    this.serverFileHashes = /* @__PURE__ */ new Map();
+    this.hashSaveTimer = null;
+    // 接続時同期: sync_start〜sync_end の間にサーバーから通知されたパスを収集
+    this.isSyncing = false;
+    this.syncingPaths = /* @__PURE__ */ new Set();
   }
   async onload() {
     await this.loadSettings();
@@ -66,7 +72,7 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         if (!this.settings.sendEnabled) return;
         if (this.ignorePaths.has(file.path)) return;
         if (this.ws?.readyState !== WebSocket.OPEN) return;
-        console.log(`PoetSync: Sending delete for ${file.path}`);
+        this.serverFileHashes.delete(file.path);
         this.ws.send(JSON.stringify({ type: "delete_file", path: file.path, timestamp: Date.now() }));
       })
     );
@@ -74,7 +80,9 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
       this.app.vault.on("rename", async (file, oldPath) => {
         if (!this.settings.sendEnabled) return;
         if (this.ws?.readyState !== WebSocket.OPEN) return;
-        console.log(`PoetSync: Sending rename ${oldPath} -> ${file.path}`);
+        const oldHash = this.serverFileHashes.get(oldPath);
+        this.serverFileHashes.delete(oldPath);
+        if (oldHash) this.serverFileHashes.set(file.path, oldHash);
         this.ws.send(JSON.stringify({ type: "rename_file", oldPath, newPath: file.path, timestamp: Date.now() }));
       })
     );
@@ -114,20 +122,42 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
   }
   async handleMessage(message) {
     const vault = this.app.vault;
-    if (message.type === "file_list") {
-      const serverFiles = message.files;
-      for (const filePath of Object.keys(serverFiles)) {
-        const localFile = vault.getAbstractFileByPath(filePath);
-        if (!localFile && this.ws?.readyState === WebSocket.OPEN) {
-          console.log(`PoetSync: Missing file detected, fetching: ${filePath}`);
-          this.ws.send(JSON.stringify({ type: "get_file", path: filePath }));
-        }
-      }
+    if (message.type === "sync_start") {
+      this.isSyncing = true;
+      this.syncingPaths.clear();
     }
     if (message.type === "file_added" || message.type === "file_changed") {
+      if (this.isSyncing) {
+        this.syncingPaths.add(message.path);
+      }
+      const serverHash = message.hash;
+      if (serverHash) {
+        const lastKnownHash = this.serverFileHashes.get(message.path);
+        if (lastKnownHash === serverHash) {
+          return;
+        }
+      }
       if (this.ws?.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: "get_file", path: message.path }));
       }
+    }
+    if (message.type === "sync_end") {
+      this.isSyncing = false;
+      const serverPaths = new Set(this.syncingPaths);
+      this.syncingPaths.clear();
+      this.app.workspace.onLayoutReady(async () => {
+        const allLocalFiles = this.app.vault.getFiles();
+        for (const file of allLocalFiles) {
+          if (!serverPaths.has(file.path)) {
+            this.ignorePaths.add(file.path);
+            this.serverFileHashes.delete(file.path);
+            await this.app.vault.delete(file);
+            setTimeout(() => this.ignorePaths.delete(file.path), 5e3);
+            console.log(`PoetSync: Removed stale file ${file.path}`);
+          }
+        }
+        this.scheduleSaveHashes();
+      });
     }
     if (message.type === "file_content") {
       const filePath = message.path;
@@ -143,8 +173,18 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         }
         await vault.create(filePath, content);
       }
+      if (message.hash) {
+        this.serverFileHashes.set(filePath, message.hash);
+        this.scheduleSaveHashes();
+      }
       setTimeout(() => this.ignorePaths.delete(filePath), 5e3);
       console.log(`PoetSync: Synced ${filePath}`);
+    }
+    if (message.type === "file_saved") {
+      if (message.hash) {
+        this.serverFileHashes.set(message.path, message.hash);
+        this.scheduleSaveHashes();
+      }
     }
     if (message.type === "file_deleted") {
       const file = vault.getAbstractFileByPath(message.path);
@@ -154,6 +194,8 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         setTimeout(() => this.ignorePaths.delete(message.path), 5e3);
         console.log(`PoetSync: Deleted ${message.path}`);
       }
+      this.serverFileHashes.delete(message.path);
+      this.scheduleSaveHashes();
     }
     if (message.type === "file_renamed") {
       const file = vault.getAbstractFileByPath(message.oldPath);
@@ -171,18 +213,35 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         }, 5e3);
         console.log(`PoetSync: Renamed ${message.oldPath} -> ${message.newPath}`);
       }
+      const oldHash = this.serverFileHashes.get(message.oldPath);
+      this.serverFileHashes.delete(message.oldPath);
+      if (oldHash) this.serverFileHashes.set(message.newPath, oldHash);
+      this.scheduleSaveHashes();
     }
+  }
+  scheduleSaveHashes() {
+    if (this.hashSaveTimer) window.clearTimeout(this.hashSaveTimer);
+    this.hashSaveTimer = window.setTimeout(() => this.saveSettings(), 3e3);
   }
   onunload() {
     if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+    if (this.hashSaveTimer) window.clearTimeout(this.hashSaveTimer);
     if (this.ws) this.ws.close();
     console.log("PoetSync plugin unloaded");
   }
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const data = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    if (data?.serverFileHashes) {
+      this.serverFileHashes = new Map(Object.entries(data.serverFileHashes));
+      console.log(`PoetSync: Loaded ${this.serverFileHashes.size} cached hashes`);
+    }
   }
   async saveSettings() {
-    await this.saveData(this.settings);
+    await this.saveData({
+      ...this.settings,
+      serverFileHashes: Object.fromEntries(this.serverFileHashes)
+    });
   }
 };
 var PoetSyncSettingTab = class extends import_obsidian.PluginSettingTab {
@@ -205,6 +264,11 @@ var PoetSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("\u9001\u4FE1\u3092\u6709\u52B9\u5316").setDesc("\u3053\u306E\u30C7\u30D0\u30A4\u30B9\u306E\u5909\u66F4\u3092\u30B5\u30FC\u30D0\u30FC\u306B\u9001\u4FE1\u3059\u308B\uFF08Ubuntu\u306F\u30AA\u30D5\u3067OK\uFF09").addToggle((toggle) => toggle.setValue(this.plugin.settings.sendEnabled).onChange(async (value) => {
       this.plugin.settings.sendEnabled = value;
       await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("\u30AD\u30E3\u30C3\u30B7\u30E5\u3092\u30AF\u30EA\u30A2").setDesc("\u30CF\u30C3\u30B7\u30E5\u30AD\u30E3\u30C3\u30B7\u30E5\u3092\u30EA\u30BB\u30C3\u30C8\u3057\u3066\u5168\u30D5\u30A1\u30A4\u30EB\u3092\u518D\u540C\u671F\u3059\u308B").addButton((button) => button.setButtonText("\u30AF\u30EA\u30A2").onClick(async () => {
+      this.plugin.serverFileHashes.clear();
+      await this.plugin.saveSettings();
+      new import_obsidian.Notice("PoetSync: \u30AD\u30E3\u30C3\u30B7\u30E5\u3092\u30AF\u30EA\u30A2\u3057\u307E\u3057\u305F\u3002\u518D\u63A5\u7D9A\u5F8C\u306B\u5168\u30D5\u30A1\u30A4\u30EB\u304C\u518D\u540C\u671F\u3055\u308C\u307E\u3059\u3002");
     }));
   }
 };

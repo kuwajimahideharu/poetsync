@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "build": "node esbuild.config.mjs && cp dist/main.js main.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
