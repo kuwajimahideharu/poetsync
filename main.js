@@ -24,6 +24,42 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
+var BINARY_EXTENSIONS = /* @__PURE__ */ new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "ico",
+  "tiff",
+  "pdf",
+  "zip",
+  "gz",
+  "tar",
+  "mp3",
+  "mp4",
+  "wav",
+  "ogg",
+  "mov",
+  "avi",
+  "mkv"
+]);
+function isBinaryExt(ext) {
+  return BINARY_EXTENSIONS.has(ext.toLowerCase());
+}
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+function base64ToArrayBuffer(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
 var DEFAULT_SETTINGS = {
   serverUrl: "ws://localhost:27124",
   enabled: true,
@@ -53,8 +89,14 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         if (this.ignorePaths.has(file.path)) return;
         if (!(file instanceof import_obsidian.TFile)) return;
         if (this.ws?.readyState !== WebSocket.OPEN) return;
-        const content = await this.app.vault.read(file);
-        this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, timestamp: Date.now() }));
+        if (isBinaryExt(file.extension)) {
+          const buffer = await this.app.vault.readBinary(file);
+          const content = arrayBufferToBase64(buffer);
+          this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, binary: true, timestamp: Date.now() }));
+        } else {
+          const content = await this.app.vault.read(file);
+          this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, timestamp: Date.now() }));
+        }
       })
     );
     this.registerEvent(
@@ -63,8 +105,14 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         if (this.ignorePaths.has(file.path)) return;
         if (!(file instanceof import_obsidian.TFile)) return;
         if (this.ws?.readyState !== WebSocket.OPEN) return;
-        const content = await this.app.vault.read(file);
-        this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, timestamp: Date.now() }));
+        if (isBinaryExt(file.extension)) {
+          const buffer = await this.app.vault.readBinary(file);
+          const content = arrayBufferToBase64(buffer);
+          this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, binary: true, timestamp: Date.now() }));
+        } else {
+          const content = await this.app.vault.read(file);
+          this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, timestamp: Date.now() }));
+        }
       })
     );
     this.registerEvent(
@@ -72,8 +120,12 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         if (!this.settings.sendEnabled) return;
         if (this.ignorePaths.has(file.path)) return;
         if (this.ws?.readyState !== WebSocket.OPEN) return;
-        this.serverFileHashes.delete(file.path);
-        this.ws.send(JSON.stringify({ type: "delete_file", path: file.path, timestamp: Date.now() }));
+        if (file instanceof import_obsidian.TFolder) {
+          this.ws.send(JSON.stringify({ type: "delete_folder", path: file.path, timestamp: Date.now() }));
+        } else {
+          this.serverFileHashes.delete(file.path);
+          this.ws.send(JSON.stringify({ type: "delete_file", path: file.path, timestamp: Date.now() }));
+        }
       })
     );
     this.registerEvent(
@@ -161,17 +213,26 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
     }
     if (message.type === "file_content") {
       const filePath = message.path;
-      const content = message.content;
       this.ignorePaths.add(filePath);
       const existingFile = vault.getAbstractFileByPath(filePath);
-      if (existingFile instanceof import_obsidian.TFile) {
-        await vault.modify(existingFile, content);
-      } else {
-        const dir = filePath.split("/").slice(0, -1).join("/");
-        if (dir && !vault.getAbstractFileByPath(dir)) {
-          await vault.createFolder(dir);
+      const dir = filePath.split("/").slice(0, -1).join("/");
+      if (dir && !vault.getAbstractFileByPath(dir)) {
+        await vault.createFolder(dir);
+      }
+      if (message.binary) {
+        const arrayBuffer = base64ToArrayBuffer(message.content);
+        if (existingFile instanceof import_obsidian.TFile) {
+          await vault.modifyBinary(existingFile, arrayBuffer);
+        } else {
+          await vault.createBinary(filePath, arrayBuffer);
         }
-        await vault.create(filePath, content);
+      } else {
+        const content = message.content;
+        if (existingFile instanceof import_obsidian.TFile) {
+          await vault.modify(existingFile, content);
+        } else {
+          await vault.create(filePath, content);
+        }
       }
       if (message.hash) {
         this.serverFileHashes.set(filePath, message.hash);
@@ -195,6 +256,20 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
         console.log(`PoetSync: Deleted ${message.path}`);
       }
       this.serverFileHashes.delete(message.path);
+      this.scheduleSaveHashes();
+    }
+    if (message.type === "folder_deleted") {
+      const folder = vault.getAbstractFileByPath(message.path);
+      if (folder) {
+        this.ignorePaths.add(message.path);
+        await vault.delete(folder, true);
+        setTimeout(() => this.ignorePaths.delete(message.path), 5e3);
+        console.log(`PoetSync: Deleted folder ${message.path}`);
+      }
+      const prefix = message.path + "/";
+      for (const key of this.serverFileHashes.keys()) {
+        if (key.startsWith(prefix)) this.serverFileHashes.delete(key);
+      }
       this.scheduleSaveHashes();
     }
     if (message.type === "file_renamed") {
