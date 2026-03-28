@@ -72,10 +72,8 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
     this.reconnectTimer = null;
     this.isConnecting = false;
     this.ignorePaths = /* @__PURE__ */ new Set();
-    // サーバー側の既知ハッシュを永続保持（再接続時の無駄な再ダウンロードを防ぐ）
     this.serverFileHashes = /* @__PURE__ */ new Map();
     this.hashSaveTimer = null;
-    // 接続時同期: sync_start〜sync_end の間にサーバーから通知されたパスを収集
     this.isSyncing = false;
     this.syncingPaths = /* @__PURE__ */ new Set();
   }
@@ -83,6 +81,9 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
     await this.loadSettings();
     this.addSettingTab(new PoetSyncSettingTab(this.app, this));
     if (this.settings.enabled) this.connect();
+    this.addRibbonIcon("refresh-cw", "PoetSync: \u518D\u63A5\u7D9A", () => {
+      this.forceReconnect();
+    });
     this.registerEvent(
       this.app.vault.on("modify", async (file) => {
         if (!this.settings.sendEnabled) return;
@@ -139,6 +140,20 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
       })
     );
     console.log("PoetSync plugin loaded");
+  }
+  forceReconnect() {
+    new import_obsidian.Notice("PoetSync: \u518D\u63A5\u7D9A\u4E2D...");
+    if (this.reconnectTimer) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      this.ws.onclose = null;
+      this.ws.close();
+      this.ws = null;
+    }
+    this.isConnecting = false;
+    this.connect();
   }
   connect() {
     if (this.isConnecting) return;
@@ -227,11 +242,10 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
           await vault.createBinary(filePath, arrayBuffer);
         }
       } else {
-        const content = message.content;
         if (existingFile instanceof import_obsidian.TFile) {
-          await vault.modify(existingFile, content);
+          await vault.modify(existingFile, message.content);
         } else {
-          await vault.create(filePath, content);
+          await vault.create(filePath, message.content);
         }
       }
       if (message.hash) {
@@ -340,10 +354,14 @@ var PoetSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.sendEnabled = value;
       await this.plugin.saveSettings();
     }));
+    new import_obsidian.Setting(containerEl).setName("\u518D\u63A5\u7D9A").setDesc("WebSocket\u63A5\u7D9A\u3092\u5207\u308A\u76F4\u3057\u3066\u518D\u63A5\u7D9A\u3059\u308B\uFF08\u540C\u671F\u304C\u6B62\u307E\u3063\u305F\u3068\u304D\u306B\u4F7F\u3046\uFF09").addButton((button) => button.setButtonText("\u518D\u63A5\u7D9A").setCta().onClick(() => {
+      this.plugin.forceReconnect();
+    }));
     new import_obsidian.Setting(containerEl).setName("\u30AD\u30E3\u30C3\u30B7\u30E5\u3092\u30AF\u30EA\u30A2").setDesc("\u30CF\u30C3\u30B7\u30E5\u30AD\u30E3\u30C3\u30B7\u30E5\u3092\u30EA\u30BB\u30C3\u30C8\u3057\u3066\u5168\u30D5\u30A1\u30A4\u30EB\u3092\u518D\u540C\u671F\u3059\u308B").addButton((button) => button.setButtonText("\u30AF\u30EA\u30A2").onClick(async () => {
       this.plugin.serverFileHashes.clear();
       await this.plugin.saveSettings();
-      new import_obsidian.Notice("PoetSync: \u30AD\u30E3\u30C3\u30B7\u30E5\u3092\u30AF\u30EA\u30A2\u3057\u307E\u3057\u305F\u3002\u518D\u63A5\u7D9A\u5F8C\u306B\u5168\u30D5\u30A1\u30A4\u30EB\u304C\u518D\u540C\u671F\u3055\u308C\u307E\u3059\u3002");
+      if (this.plugin.ws) this.plugin.ws.close();
+      new import_obsidian.Notice("PoetSync: \u30AD\u30E3\u30C3\u30B7\u30E5\u3092\u30AF\u30EA\u30A2\u3057\u307E\u3057\u305F\u30025\u79D2\u5F8C\u306B\u518D\u63A5\u7D9A\u3057\u3066\u5168\u30D5\u30A1\u30A4\u30EB\u3092\u518D\u540C\u671F\u3057\u307E\u3059\u3002");
     }));
   }
 };
