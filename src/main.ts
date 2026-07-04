@@ -24,16 +24,31 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
   return bytes.buffer;
 }
 
+// "foo/bar.md" → "foo/bar (競合 2026-07-04 1830).md"
+function makeConflictPath(filePath: string): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())}`;
+  const dot = filePath.lastIndexOf('.');
+  const slash = filePath.lastIndexOf('/');
+  if (dot > slash) {
+    return `${filePath.slice(0, dot)} (競合 ${stamp})${filePath.slice(dot)}`;
+  }
+  return `${filePath} (競合 ${stamp})`;
+}
+
 interface PoetSyncSettings {
   serverUrl: string;
   enabled: boolean;
   sendEnabled: boolean;
+  authToken: string;
 }
 
 const DEFAULT_SETTINGS: PoetSyncSettings = {
   serverUrl: 'ws://localhost:27124',
   enabled: true,
-  sendEnabled: true
+  sendEnabled: true,
+  authToken: ''
 };
 
 export default class PoetSyncPlugin extends Plugin {
@@ -43,6 +58,9 @@ export default class PoetSyncPlugin extends Plugin {
   isConnecting: boolean = false;
   ignorePaths: Set<string> = new Set();
   serverFileHashes: Map<string, string> = new Map();
+  // サーバーの file_saved 応答がまだ届いていない（＝未送信かもしれない）ローカル変更。
+  // オフライン中の作成・編集もここに記録し、再接続時にアップロードする
+  pendingPaths: Set<string> = new Set();
   hashSaveTimer: number | null = null;
   isSyncing: boolean = false;
   syncingPaths: Set<string> = new Set();
@@ -61,15 +79,7 @@ export default class PoetSyncPlugin extends Plugin {
         if (!this.settings.sendEnabled) return;
         if (this.ignorePaths.has(file.path)) return;
         if (!(file instanceof TFile)) return;
-        if (this.ws?.readyState !== WebSocket.OPEN) return;
-        if (isBinaryExt(file.extension)) {
-          const buffer = await this.app.vault.readBinary(file);
-          const content = arrayBufferToBase64(buffer);
-          this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, binary: true, timestamp: Date.now() }));
-        } else {
-          const content = await this.app.vault.read(file);
-          this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, timestamp: Date.now() }));
-        }
+        await this.uploadFile(file);
       })
     );
 
@@ -78,15 +88,7 @@ export default class PoetSyncPlugin extends Plugin {
         if (!this.settings.sendEnabled) return;
         if (this.ignorePaths.has(file.path)) return;
         if (!(file instanceof TFile)) return;
-        if (this.ws?.readyState !== WebSocket.OPEN) return;
-        if (isBinaryExt(file.extension)) {
-          const buffer = await this.app.vault.readBinary(file);
-          const content = arrayBufferToBase64(buffer);
-          this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, binary: true, timestamp: Date.now() }));
-        } else {
-          const content = await this.app.vault.read(file);
-          this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, timestamp: Date.now() }));
-        }
+        await this.uploadFile(file);
       })
     );
 
@@ -94,6 +96,7 @@ export default class PoetSyncPlugin extends Plugin {
       this.app.vault.on('delete', (file) => {
         if (!this.settings.sendEnabled) return;
         if (this.ignorePaths.has(file.path)) return;
+        this.pendingPaths.delete(file.path);
         if (this.ws?.readyState !== WebSocket.OPEN) return;
         if (file instanceof TFolder) {
           this.ws.send(JSON.stringify({ type: 'delete_folder', path: file.path, timestamp: Date.now() }));
@@ -107,15 +110,61 @@ export default class PoetSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on('rename', async (file, oldPath) => {
         if (!this.settings.sendEnabled) return;
-        if (this.ws?.readyState !== WebSocket.OPEN) return;
+        if (file instanceof TFolder) {
+          // フォルダの改名・移動はファイルと区別して送る
+          const prefix = oldPath + '/';
+          for (const key of [...this.serverFileHashes.keys()]) {
+            if (key.startsWith(prefix)) {
+              const hash = this.serverFileHashes.get(key)!;
+              this.serverFileHashes.delete(key);
+              this.serverFileHashes.set(file.path + '/' + key.slice(prefix.length), hash);
+            }
+          }
+          for (const key of [...this.pendingPaths]) {
+            if (key.startsWith(prefix)) {
+              this.pendingPaths.delete(key);
+              this.pendingPaths.add(file.path + '/' + key.slice(prefix.length));
+            }
+          }
+          this.scheduleSaveHashes();
+          if (this.ws?.readyState !== WebSocket.OPEN) return;
+          this.ws.send(JSON.stringify({ type: 'rename_folder', oldPath, newPath: file.path, timestamp: Date.now() }));
+          return;
+        }
         const oldHash = this.serverFileHashes.get(oldPath);
         this.serverFileHashes.delete(oldPath);
         if (oldHash) this.serverFileHashes.set(file.path, oldHash);
+        if (this.pendingPaths.delete(oldPath)) this.pendingPaths.add(file.path);
+        this.scheduleSaveHashes();
+        if (this.ws?.readyState !== WebSocket.OPEN) return;
         this.ws.send(JSON.stringify({ type: 'rename_file', oldPath, newPath: file.path, timestamp: Date.now() }));
       })
     );
 
     console.log('PoetSync plugin loaded');
+  }
+
+  // ローカルの変更をサーバーへ送る。オフライン時は pendingPaths に記録だけして
+  // 再接続時（sync_end 処理）に送信する
+  async uploadFile(file: TFile) {
+    this.pendingPaths.add(file.path);
+    this.scheduleSaveHashes();
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (isBinaryExt(file.extension)) {
+      const buffer = await this.app.vault.readBinary(file);
+      const content = arrayBufferToBase64(buffer);
+      this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, binary: true, timestamp: Date.now() }));
+    } else {
+      const content = await this.app.vault.read(file);
+      this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, timestamp: Date.now() }));
+    }
+  }
+
+  buildServerUrl(): string {
+    const token = this.settings.authToken.trim();
+    if (!token) return this.settings.serverUrl;
+    const sep = this.settings.serverUrl.includes('?') ? '&' : '?';
+    return `${this.settings.serverUrl}${sep}token=${encodeURIComponent(token)}`;
   }
 
   forceReconnect() {
@@ -138,7 +187,7 @@ export default class PoetSyncPlugin extends Plugin {
     this.isConnecting = true;
 
     try {
-      this.ws = new WebSocket(this.settings.serverUrl);
+      this.ws = new WebSocket(this.buildServerUrl());
 
       this.ws.onopen = () => {
         this.isConnecting = false;
@@ -203,12 +252,31 @@ export default class PoetSyncPlugin extends Plugin {
       this.app.workspace.onLayoutReady(async () => {
         const allLocalFiles = this.app.vault.getFiles();
         for (const file of allLocalFiles) {
-          if (!serverPaths.has(file.path)) {
+          if (serverPaths.has(file.path)) continue;
+          if (this.serverFileHashes.has(file.path)) {
+            // 同期済みだったファイルがサーバーから消えた → 他デバイスで削除された
             this.ignorePaths.add(file.path);
             this.serverFileHashes.delete(file.path);
+            this.pendingPaths.delete(file.path);
             await this.app.vault.delete(file);
             setTimeout(() => this.ignorePaths.delete(file.path), 5000);
             console.log(`PoetSync: Removed stale file ${file.path}`);
+          } else if (this.settings.sendEnabled) {
+            // 同期履歴がない＝オフライン中などに作られた新規ファイル → 削除せずアップロード
+            console.log(`PoetSync: Uploading new local file ${file.path}`);
+            await this.uploadFile(file);
+          }
+        }
+        // オフライン中に編集したファイル（サーバーにもあるもの）を送信
+        if (this.settings.sendEnabled) {
+          for (const p of [...this.pendingPaths]) {
+            const f = this.app.vault.getAbstractFileByPath(p);
+            if (f instanceof TFile) {
+              console.log(`PoetSync: Uploading pending change ${p}`);
+              await this.uploadFile(f);
+            } else {
+              this.pendingPaths.delete(p);
+            }
           }
         }
         this.scheduleSaveHashes();
@@ -217,8 +285,29 @@ export default class PoetSyncPlugin extends Plugin {
 
     if (message.type === 'file_content') {
       const filePath: string = message.path;
-      this.ignorePaths.add(filePath);
       const existingFile = vault.getAbstractFileByPath(filePath);
+
+      // ローカルに未送信の変更があるのに、サーバーから別の内容が届いた → 競合。
+      // ローカル版を競合コピーとして退避してからサーバー版を適用する
+      if (this.pendingPaths.has(filePath) && existingFile instanceof TFile) {
+        const conflictPath = makeConflictPath(filePath);
+        try {
+          if (isBinaryExt(existingFile.extension)) {
+            const localBuffer = await vault.readBinary(existingFile);
+            await vault.createBinary(conflictPath, localBuffer);
+          } else {
+            const localContent = await vault.read(existingFile);
+            await vault.create(conflictPath, localContent);
+          }
+          new Notice(`PoetSync: 競合を検出。ローカル版を「${conflictPath}」に保存しました`);
+          console.log(`PoetSync: Conflict detected, local copy saved as ${conflictPath}`);
+        } catch (err) {
+          console.error('PoetSync: Conflict copy failed', err);
+        }
+        this.pendingPaths.delete(filePath);
+      }
+
+      this.ignorePaths.add(filePath);
       const dir = filePath.split('/').slice(0, -1).join('/');
       if (dir && !vault.getAbstractFileByPath(dir)) {
         await vault.createFolder(dir);
@@ -246,10 +335,11 @@ export default class PoetSyncPlugin extends Plugin {
     }
 
     if (message.type === 'file_saved') {
+      this.pendingPaths.delete(message.path);
       if (message.hash) {
         this.serverFileHashes.set(message.path, message.hash);
-        this.scheduleSaveHashes();
       }
+      this.scheduleSaveHashes();
     }
 
     if (message.type === 'file_deleted') {
@@ -261,6 +351,7 @@ export default class PoetSyncPlugin extends Plugin {
         console.log(`PoetSync: Deleted ${message.path}`);
       }
       this.serverFileHashes.delete(message.path);
+      this.pendingPaths.delete(message.path);
       this.scheduleSaveHashes();
     }
 
@@ -275,6 +366,9 @@ export default class PoetSyncPlugin extends Plugin {
       const prefix = message.path + '/';
       for (const key of this.serverFileHashes.keys()) {
         if (key.startsWith(prefix)) this.serverFileHashes.delete(key);
+      }
+      for (const key of [...this.pendingPaths]) {
+        if (key.startsWith(prefix)) this.pendingPaths.delete(key);
       }
       this.scheduleSaveHashes();
     }
@@ -298,6 +392,40 @@ export default class PoetSyncPlugin extends Plugin {
       const oldHash = this.serverFileHashes.get(message.oldPath);
       this.serverFileHashes.delete(message.oldPath);
       if (oldHash) this.serverFileHashes.set(message.newPath, oldHash);
+      if (this.pendingPaths.delete(message.oldPath)) this.pendingPaths.add(message.newPath);
+      this.scheduleSaveHashes();
+    }
+
+    if (message.type === 'folder_renamed') {
+      const folder = vault.getAbstractFileByPath(message.oldPath);
+      if (folder instanceof TFolder) {
+        this.ignorePaths.add(message.oldPath);
+        this.ignorePaths.add(message.newPath);
+        const dir = message.newPath.split('/').slice(0, -1).join('/');
+        if (dir && !vault.getAbstractFileByPath(dir)) {
+          await vault.createFolder(dir);
+        }
+        await vault.rename(folder, message.newPath);
+        setTimeout(() => {
+          this.ignorePaths.delete(message.oldPath);
+          this.ignorePaths.delete(message.newPath);
+        }, 5000);
+        console.log(`PoetSync: Renamed folder ${message.oldPath} -> ${message.newPath}`);
+      }
+      const prefix = message.oldPath + '/';
+      for (const key of [...this.serverFileHashes.keys()]) {
+        if (key.startsWith(prefix)) {
+          const hash = this.serverFileHashes.get(key)!;
+          this.serverFileHashes.delete(key);
+          this.serverFileHashes.set(message.newPath + '/' + key.slice(prefix.length), hash);
+        }
+      }
+      for (const key of [...this.pendingPaths]) {
+        if (key.startsWith(prefix)) {
+          this.pendingPaths.delete(key);
+          this.pendingPaths.add(message.newPath + '/' + key.slice(prefix.length));
+        }
+      }
       this.scheduleSaveHashes();
     }
   }
@@ -317,9 +445,17 @@ export default class PoetSyncPlugin extends Plugin {
   async loadSettings() {
     const data = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    delete (this.settings as any).serverFileHashes;
+    delete (this.settings as any).pendingPaths;
     if (data?.serverFileHashes) {
       this.serverFileHashes = new Map(Object.entries(data.serverFileHashes));
       console.log(`PoetSync: Loaded ${this.serverFileHashes.size} cached hashes`);
+    }
+    if (Array.isArray(data?.pendingPaths)) {
+      this.pendingPaths = new Set(data.pendingPaths);
+      if (this.pendingPaths.size > 0) {
+        console.log(`PoetSync: Loaded ${this.pendingPaths.size} pending paths`);
+      }
     }
   }
 
@@ -327,6 +463,7 @@ export default class PoetSyncPlugin extends Plugin {
     await this.saveData({
       ...this.settings,
       serverFileHashes: Object.fromEntries(this.serverFileHashes),
+      pendingPaths: [...this.pendingPaths],
     });
   }
 }
@@ -352,6 +489,17 @@ class PoetSyncSettingTab extends PluginSettingTab {
         .setValue(this.plugin.settings.serverUrl)
         .onChange(async (value) => {
           this.plugin.settings.serverUrl = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('認証トークン')
+      .setDesc('サーバー側で POETSYNC_TOKEN を設定した場合のみ入力（空欄なら認証なし）')
+      .addText(text => text
+        .setPlaceholder('（未設定）')
+        .setValue(this.plugin.settings.authToken)
+        .onChange(async (value) => {
+          this.plugin.settings.authToken = value;
           await this.plugin.saveSettings();
         }));
 
