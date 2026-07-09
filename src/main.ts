@@ -1,4 +1,5 @@
 import { App, Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder } from 'obsidian';
+import SparkMD5 from 'spark-md5';
 
 const BINARY_EXTENSIONS = new Set([
   'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'tiff',
@@ -22,6 +23,16 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes.buffer;
+}
+
+// サーバー（Node の crypto md5）と同じ値になるよう、
+// テキストは UTF-8 変換つきの SparkMD5.hash、バイナリは ArrayBuffer 版を使う
+function md5OfText(content: string): string {
+  return SparkMD5.hash(content);
+}
+
+function md5OfBuffer(buffer: ArrayBuffer): string {
+  return SparkMD5.ArrayBuffer.hash(buffer);
 }
 
 // "foo/bar.md" → "foo/bar (競合 2026-07-04 1830).md"
@@ -61,6 +72,10 @@ export default class PoetSyncPlugin extends Plugin {
   // サーバーの file_saved 応答がまだ届いていない（＝未送信かもしれない）ローカル変更。
   // オフライン中の作成・編集もここに記録し、再接続時にアップロードする
   pendingPaths: Set<string> = new Set();
+  // 最後に実際にサーバーへ送信した内容の MD5。file_saved の応答が失われても、
+  // ローカル内容がこれと一致していれば「送信済みの変更しかない」と判断でき、
+  // 偽の競合コピーを作らずに済む
+  lastSentHashes: Map<string, string> = new Map();
   hashSaveTimer: number | null = null;
   isSyncing: boolean = false;
   syncingPaths: Set<string> = new Set();
@@ -97,6 +112,7 @@ export default class PoetSyncPlugin extends Plugin {
         if (!this.settings.sendEnabled) return;
         if (this.ignorePaths.has(file.path)) return;
         this.pendingPaths.delete(file.path);
+        this.lastSentHashes.delete(file.path);
         if (this.ws?.readyState !== WebSocket.OPEN) return;
         if (file instanceof TFolder) {
           this.ws.send(JSON.stringify({ type: 'delete_folder', path: file.path, timestamp: Date.now() }));
@@ -126,6 +142,13 @@ export default class PoetSyncPlugin extends Plugin {
               this.pendingPaths.add(file.path + '/' + key.slice(prefix.length));
             }
           }
+          for (const key of [...this.lastSentHashes.keys()]) {
+            if (key.startsWith(prefix)) {
+              const hash = this.lastSentHashes.get(key)!;
+              this.lastSentHashes.delete(key);
+              this.lastSentHashes.set(file.path + '/' + key.slice(prefix.length), hash);
+            }
+          }
           this.scheduleSaveHashes();
           if (this.ws?.readyState !== WebSocket.OPEN) return;
           this.ws.send(JSON.stringify({ type: 'rename_folder', oldPath, newPath: file.path, timestamp: Date.now() }));
@@ -135,6 +158,9 @@ export default class PoetSyncPlugin extends Plugin {
         this.serverFileHashes.delete(oldPath);
         if (oldHash) this.serverFileHashes.set(file.path, oldHash);
         if (this.pendingPaths.delete(oldPath)) this.pendingPaths.add(file.path);
+        const oldSent = this.lastSentHashes.get(oldPath);
+        this.lastSentHashes.delete(oldPath);
+        if (oldSent) this.lastSentHashes.set(file.path, oldSent);
         this.scheduleSaveHashes();
         if (this.ws?.readyState !== WebSocket.OPEN) return;
         this.ws.send(JSON.stringify({ type: 'rename_file', oldPath, newPath: file.path, timestamp: Date.now() }));
@@ -153,11 +179,14 @@ export default class PoetSyncPlugin extends Plugin {
     if (isBinaryExt(file.extension)) {
       const buffer = await this.app.vault.readBinary(file);
       const content = arrayBufferToBase64(buffer);
+      this.lastSentHashes.set(file.path, md5OfBuffer(buffer));
       this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, binary: true, timestamp: Date.now() }));
     } else {
       const content = await this.app.vault.read(file);
+      this.lastSentHashes.set(file.path, md5OfText(content));
       this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, timestamp: Date.now() }));
     }
+    this.scheduleSaveHashes();
   }
 
   buildServerUrl(): string {
@@ -239,6 +268,26 @@ export default class PoetSyncPlugin extends Plugin {
         if (lastKnownHash === serverHash) {
           return;
         }
+        // キャッシュ上は不一致でも、実際のローカル内容がサーバーと同一なら
+        // すでに同期済み（file_saved の応答が失われただけ等）。ダウンロードも
+        // 競合判定も不要なので、キャッシュと未送信フラグを整えて終わる
+        const localFile = vault.getAbstractFileByPath(message.path);
+        if (localFile instanceof TFile) {
+          try {
+            const localHash = isBinaryExt(localFile.extension)
+              ? md5OfBuffer(await vault.readBinary(localFile))
+              : md5OfText(await vault.read(localFile));
+            if (localHash === serverHash) {
+              this.serverFileHashes.set(message.path, serverHash);
+              this.pendingPaths.delete(message.path);
+              this.lastSentHashes.delete(message.path);
+              this.scheduleSaveHashes();
+              return;
+            }
+          } catch (err) {
+            console.error('PoetSync: Local hash check failed', err);
+          }
+        }
       }
       if (this.ws?.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: 'get_file', path: message.path }));
@@ -287,24 +336,45 @@ export default class PoetSyncPlugin extends Plugin {
       const filePath: string = message.path;
       const existingFile = vault.getAbstractFileByPath(filePath);
 
-      // ローカルに未送信の変更があるのに、サーバーから別の内容が届いた → 競合。
-      // ローカル版を競合コピーとして退避してからサーバー版を適用する
+      // ローカルに未送信の変更があるのに、サーバーから別の内容が届いた → 競合の可能性。
+      // ただし以下は偽競合なのでコピーを作らない：
+      //  (a) ローカル内容がサーバー版と同一
+      //  (b) ローカル内容が「最後にサーバーへ送信した内容」と同一
+      //      （＝送信は済んでいて file_saved の応答だけ失われたケース。
+      //        サーバー版はその送信を取り込んだ後の新しい版なので、退避する価値がない）
+      // 本当に両側で編集が分岐したときだけローカル版を競合コピーとして退避する
       if (this.pendingPaths.has(filePath) && existingFile instanceof TFile) {
-        const conflictPath = makeConflictPath(filePath);
         try {
+          let localHash: string;
+          let localText: string | null = null;
+          let localBuffer: ArrayBuffer | null = null;
           if (isBinaryExt(existingFile.extension)) {
-            const localBuffer = await vault.readBinary(existingFile);
-            await vault.createBinary(conflictPath, localBuffer);
+            localBuffer = await vault.readBinary(existingFile);
+            localHash = md5OfBuffer(localBuffer);
           } else {
-            const localContent = await vault.read(existingFile);
-            await vault.create(conflictPath, localContent);
+            localText = await vault.read(existingFile);
+            localHash = md5OfText(localText);
           }
-          new Notice(`PoetSync: 競合を検出。ローカル版を「${conflictPath}」に保存しました`);
-          console.log(`PoetSync: Conflict detected, local copy saved as ${conflictPath}`);
+          const sameAsServer = message.hash ? localHash === message.hash
+            : (localText !== null && !message.binary && localText === message.content);
+          const alreadySent = localHash === this.lastSentHashes.get(filePath);
+          if (sameAsServer || alreadySent) {
+            console.log(`PoetSync: Stale pending flag for ${filePath} (${sameAsServer ? 'same as server' : 'already sent'}), skipping conflict copy`);
+          } else {
+            const conflictPath = makeConflictPath(filePath);
+            if (localBuffer !== null) {
+              await vault.createBinary(conflictPath, localBuffer);
+            } else {
+              await vault.create(conflictPath, localText!);
+            }
+            new Notice(`PoetSync: 競合を検出。ローカル版を「${conflictPath}」に保存しました`);
+            console.log(`PoetSync: Conflict detected, local copy saved as ${conflictPath}`);
+          }
         } catch (err) {
           console.error('PoetSync: Conflict copy failed', err);
         }
         this.pendingPaths.delete(filePath);
+        this.lastSentHashes.delete(filePath);
       }
 
       this.ignorePaths.add(filePath);
@@ -336,6 +406,7 @@ export default class PoetSyncPlugin extends Plugin {
 
     if (message.type === 'file_saved') {
       this.pendingPaths.delete(message.path);
+      this.lastSentHashes.delete(message.path);
       if (message.hash) {
         this.serverFileHashes.set(message.path, message.hash);
       }
@@ -352,6 +423,7 @@ export default class PoetSyncPlugin extends Plugin {
       }
       this.serverFileHashes.delete(message.path);
       this.pendingPaths.delete(message.path);
+      this.lastSentHashes.delete(message.path);
       this.scheduleSaveHashes();
     }
 
@@ -369,6 +441,9 @@ export default class PoetSyncPlugin extends Plugin {
       }
       for (const key of [...this.pendingPaths]) {
         if (key.startsWith(prefix)) this.pendingPaths.delete(key);
+      }
+      for (const key of [...this.lastSentHashes.keys()]) {
+        if (key.startsWith(prefix)) this.lastSentHashes.delete(key);
       }
       this.scheduleSaveHashes();
     }
@@ -393,6 +468,9 @@ export default class PoetSyncPlugin extends Plugin {
       this.serverFileHashes.delete(message.oldPath);
       if (oldHash) this.serverFileHashes.set(message.newPath, oldHash);
       if (this.pendingPaths.delete(message.oldPath)) this.pendingPaths.add(message.newPath);
+      const oldSent = this.lastSentHashes.get(message.oldPath);
+      this.lastSentHashes.delete(message.oldPath);
+      if (oldSent) this.lastSentHashes.set(message.newPath, oldSent);
       this.scheduleSaveHashes();
     }
 
@@ -426,6 +504,13 @@ export default class PoetSyncPlugin extends Plugin {
           this.pendingPaths.add(message.newPath + '/' + key.slice(prefix.length));
         }
       }
+      for (const key of [...this.lastSentHashes.keys()]) {
+        if (key.startsWith(prefix)) {
+          const hash = this.lastSentHashes.get(key)!;
+          this.lastSentHashes.delete(key);
+          this.lastSentHashes.set(message.newPath + '/' + key.slice(prefix.length), hash);
+        }
+      }
       this.scheduleSaveHashes();
     }
   }
@@ -447,6 +532,7 @@ export default class PoetSyncPlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
     delete (this.settings as any).serverFileHashes;
     delete (this.settings as any).pendingPaths;
+    delete (this.settings as any).lastSentHashes;
     if (data?.serverFileHashes) {
       this.serverFileHashes = new Map(Object.entries(data.serverFileHashes));
       console.log(`PoetSync: Loaded ${this.serverFileHashes.size} cached hashes`);
@@ -457,6 +543,9 @@ export default class PoetSyncPlugin extends Plugin {
         console.log(`PoetSync: Loaded ${this.pendingPaths.size} pending paths`);
       }
     }
+    if (data?.lastSentHashes) {
+      this.lastSentHashes = new Map(Object.entries(data.lastSentHashes));
+    }
   }
 
   async saveSettings() {
@@ -464,6 +553,7 @@ export default class PoetSyncPlugin extends Plugin {
       ...this.settings,
       serverFileHashes: Object.fromEntries(this.serverFileHashes),
       pendingPaths: [...this.pendingPaths],
+      lastSentHashes: Object.fromEntries(this.lastSentHashes),
     });
   }
 }
