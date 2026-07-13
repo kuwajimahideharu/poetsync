@@ -173,18 +173,33 @@ export default class PoetSyncPlugin extends Plugin {
   // ローカルの変更をサーバーへ送る。オフライン時は pendingPaths に記録だけして
   // 再接続時（sync_end 処理）に送信する
   async uploadFile(file: TFile) {
+    let buffer: ArrayBuffer | null = null;
+    let text: string | null = null;
+    let hash: string;
+    if (isBinaryExt(file.extension)) {
+      buffer = await this.app.vault.readBinary(file);
+      hash = md5OfBuffer(buffer);
+    } else {
+      text = await this.app.vault.read(file);
+      hash = md5OfText(text);
+    }
+    // 内容が「最後に同期したサーバー版」と同一なら送るものがない。
+    // リモート適用による modify イベントが ignorePaths の期限（5秒）を過ぎて
+    // 遅れて届くと（iOSで頻発）ここに来るので、未送信フラグを立てずに終わる。
+    // 立てたままオフラインになると、次回接続時の偽競合コピーの原因になる
+    if (hash === this.serverFileHashes.get(file.path)) {
+      if (this.pendingPaths.delete(file.path)) this.scheduleSaveHashes();
+      return;
+    }
     this.pendingPaths.add(file.path);
     this.scheduleSaveHashes();
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    if (isBinaryExt(file.extension)) {
-      const buffer = await this.app.vault.readBinary(file);
+    this.lastSentHashes.set(file.path, hash);
+    if (buffer !== null) {
       const content = arrayBufferToBase64(buffer);
-      this.lastSentHashes.set(file.path, md5OfBuffer(buffer));
       this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, binary: true, timestamp: Date.now() }));
     } else {
-      const content = await this.app.vault.read(file);
-      this.lastSentHashes.set(file.path, md5OfText(content));
-      this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content, timestamp: Date.now() }));
+      this.ws.send(JSON.stringify({ type: 'save_file', path: file.path, content: text, timestamp: Date.now() }));
     }
     this.scheduleSaveHashes();
   }
@@ -358,8 +373,12 @@ export default class PoetSyncPlugin extends Plugin {
           const sameAsServer = message.hash ? localHash === message.hash
             : (localText !== null && !message.binary && localText === message.content);
           const alreadySent = localHash === this.lastSentHashes.get(filePath);
-          if (sameAsServer || alreadySent) {
-            console.log(`PoetSync: Stale pending flag for ${filePath} (${sameAsServer ? 'same as server' : 'already sent'}), skipping conflict copy`);
+          // ローカル内容が「最後に同期したサーバー版」と同一なら、ローカルでは
+          // 実質何も編集されていない（リモート適用の遅延イベントで立った偽フラグ）。
+          // サーバー側だけが先に進んだ状態なので、退避すべき独自データはない
+          const unchangedFromBase = localHash === this.serverFileHashes.get(filePath);
+          if (sameAsServer || alreadySent || unchangedFromBase) {
+            console.log(`PoetSync: Stale pending flag for ${filePath} (${sameAsServer ? 'same as server' : alreadySent ? 'already sent' : 'unchanged from last sync'}), skipping conflict copy`);
           } else {
             const conflictPath = makeConflictPath(filePath);
             if (localBuffer !== null) {

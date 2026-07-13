@@ -638,18 +638,29 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
   // ローカルの変更をサーバーへ送る。オフライン時は pendingPaths に記録だけして
   // 再接続時（sync_end 処理）に送信する
   async uploadFile(file) {
+    let buffer = null;
+    let text = null;
+    let hash;
+    if (isBinaryExt(file.extension)) {
+      buffer = await this.app.vault.readBinary(file);
+      hash = md5OfBuffer(buffer);
+    } else {
+      text = await this.app.vault.read(file);
+      hash = md5OfText(text);
+    }
+    if (hash === this.serverFileHashes.get(file.path)) {
+      if (this.pendingPaths.delete(file.path)) this.scheduleSaveHashes();
+      return;
+    }
     this.pendingPaths.add(file.path);
     this.scheduleSaveHashes();
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    if (isBinaryExt(file.extension)) {
-      const buffer = await this.app.vault.readBinary(file);
+    this.lastSentHashes.set(file.path, hash);
+    if (buffer !== null) {
       const content = arrayBufferToBase64(buffer);
-      this.lastSentHashes.set(file.path, md5OfBuffer(buffer));
       this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, binary: true, timestamp: Date.now() }));
     } else {
-      const content = await this.app.vault.read(file);
-      this.lastSentHashes.set(file.path, md5OfText(content));
-      this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content, timestamp: Date.now() }));
+      this.ws.send(JSON.stringify({ type: "save_file", path: file.path, content: text, timestamp: Date.now() }));
     }
     this.scheduleSaveHashes();
   }
@@ -792,8 +803,9 @@ var PoetSyncPlugin = class extends import_obsidian.Plugin {
           }
           const sameAsServer = message.hash ? localHash === message.hash : localText !== null && !message.binary && localText === message.content;
           const alreadySent = localHash === this.lastSentHashes.get(filePath);
-          if (sameAsServer || alreadySent) {
-            console.log(`PoetSync: Stale pending flag for ${filePath} (${sameAsServer ? "same as server" : "already sent"}), skipping conflict copy`);
+          const unchangedFromBase = localHash === this.serverFileHashes.get(filePath);
+          if (sameAsServer || alreadySent || unchangedFromBase) {
+            console.log(`PoetSync: Stale pending flag for ${filePath} (${sameAsServer ? "same as server" : alreadySent ? "already sent" : "unchanged from last sync"}), skipping conflict copy`);
           } else {
             const conflictPath = makeConflictPath(filePath);
             if (localBuffer !== null) {
